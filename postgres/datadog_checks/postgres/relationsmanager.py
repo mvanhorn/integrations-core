@@ -363,51 +363,135 @@ TABLE_BLOAT = {
 }
 
 
-# adapted from https://wiki.postgresql.org/wiki/Show_database_bloat and https://github.com/bucardo/check_postgres/
+# B-tree index bloat, adapted from https://github.com/ioguix/pgsql-bloat-estimation/tree/master/btree
+# Estimated row width uses the indexed columns only; a B-tree index does not store the rest of the row.
 INDEX_BLOAT_QUERY = """
 SELECT
-    schemaname, relname, iname,
-    ROUND((CASE WHEN iotta=0 OR ipages=0 THEN 0.0 ELSE ipages::float/iotta END)::numeric,1) AS ibloat
+    schemaname,
+    relname,
+    iname,
+    ROUND(
+        (CASE WHEN est_pages <= 0 OR ipages <= 0 THEN 0.0 ELSE ipages::float / est_pages END)::numeric,
+        1
+    ) AS ibloat
 FROM (
     SELECT
-    schemaname, cc.relname as relname,
-    COALESCE(c2.relname,'?') AS iname, COALESCE(c2.reltuples,0) AS ituples, COALESCE(c2.relpages,0) AS ipages,
-    COALESCE(CEIL((c2.reltuples*(datahdr-12))/(bs-20::float)),0) AS iotta -- very rough approximation, assumes all cols
-    FROM (
-    SELECT
-        ma,bs,schemaname,tablename,
-        (datawidth+(hdr+ma-(case when hdr%ma=0 THEN ma ELSE hdr%ma END)))::numeric AS datahdr,
-        (maxfracsum*(nullhdr+ma-(case when nullhdr%ma=0 THEN ma ELSE nullhdr%ma END))) AS nullhdr2
+        nspname AS schemaname,
+        tblname AS relname,
+        idxname AS iname,
+        ipages,
+        coalesce(1 + ceil(reltuples / nullif(floor(
+            (bs - pageopqdata - pagehdr) * fillfactor / (100 * (4 + nulldatahdrwidth)::float)
+        ), 0)), 0) AS est_pages
     FROM (
         SELECT
-    schemaname, tablename, hdr, ma, bs,
-    SUM((1-null_frac)*avg_width) AS datawidth,
-    MAX(null_frac) AS maxfracsum,
-    hdr+(
-        SELECT 1+count(*)/8
-        FROM pg_stats s2
-        WHERE null_frac<>0 AND s2.schemaname = s.schemaname AND s2.tablename = s.tablename
-    ) AS nullhdr
-        FROM pg_stats s, (
-    SELECT
-        (SELECT current_setting('block_size')::numeric) AS bs,
-        CASE WHEN substring(v,12,3) IN ('8.0','8.1','8.2') THEN 27 ELSE 23 END AS hdr,
-        CASE WHEN v ~ 'mingw32' THEN 8 ELSE 4 END AS ma
-    FROM (SELECT version() AS v) AS foo
-        ) AS constants
-        GROUP BY 1,2,3,4,5
-    ) AS foo
-    ) AS rs
-    JOIN pg_class cc ON cc.relname = rs.tablename
-    JOIN pg_namespace nn ON cc.relnamespace = nn.oid
-    AND nn.nspname = rs.schemaname
-    AND nn.nspname <> 'information_schema'
-    LEFT JOIN pg_index i ON indrelid = cc.oid
-    LEFT JOIN pg_class c2 ON c2.oid = i.indexrelid
-) AS sml WHERE {relations};
+            nspname,
+            tblname,
+            idxname,
+            reltuples,
+            ipages,
+            fillfactor,
+            bs,
+            pagehdr,
+            pageopqdata,
+            (
+                index_tuple_hdr_bm
+                + maxalign - CASE
+                    WHEN index_tuple_hdr_bm % maxalign = 0 THEN maxalign
+                    ELSE index_tuple_hdr_bm % maxalign
+                END
+                + nulldatawidth
+                + maxalign - CASE
+                    WHEN nulldatawidth = 0 THEN 0
+                    WHEN nulldatawidth::integer % maxalign = 0 THEN maxalign
+                    ELSE nulldatawidth::integer % maxalign
+                END
+            )::numeric AS nulldatahdrwidth
+        FROM (
+            SELECT
+                n.nspname,
+                i.tblname,
+                i.idxname,
+                coalesce(i.reltuples, 0) AS reltuples,
+                coalesce(i.relpages, 0) AS ipages,
+                i.fillfactor,
+                current_setting('block_size')::numeric AS bs,
+                CASE
+                    WHEN version() ~ 'mingw32|64-bit|x86_64|ppc64|ia64|amd64|aarch64|arm64' THEN 8
+                    ELSE 4
+                END AS maxalign,
+                24 AS pagehdr,
+                16 AS pageopqdata,
+                CASE
+                    WHEN max(coalesce(s.null_frac, 0)) = 0 THEN 8
+                    ELSE 8 + ((32 + 8 - 1) / 8)
+                END AS index_tuple_hdr_bm,
+                sum((1 - coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 1024)) AS nulldatawidth
+            FROM (
+                SELECT
+                    ct.relname AS tblname,
+                    ct.relnamespace,
+                    ic.idxname,
+                    ic.reltuples,
+                    ic.relpages,
+                    ic.fillfactor,
+                    coalesce(a1.attname, a2.attname) AS attname,
+                    CASE WHEN a1.attnum IS NULL THEN ic.idxname ELSE ct.relname END AS attrelname
+                FROM (
+                    SELECT
+                        idx_data.idxname,
+                        idx_data.reltuples,
+                        idx_data.relpages,
+                        idx_data.tbloid,
+                        idx_data.idxoid,
+                        idx_data.fillfactor,
+                        idx_data.indkey,
+                        gs.attpos
+                    FROM (
+                        SELECT
+                            ci.relname AS idxname,
+                            ci.reltuples,
+                            ci.relpages,
+                            i.indrelid AS tbloid,
+                            i.indexrelid AS idxoid,
+                            coalesce(
+                                substring(
+                                    array_to_string(ci.reloptions, ' ') from 'fillfactor=([0-9]+)'
+                                )::smallint,
+                                90
+                            ) AS fillfactor,
+                            i.indnatts,
+                            string_to_array(textin(int2vectorout(i.indkey)), ' ')::int[] AS indkey
+                        FROM pg_index i
+                        JOIN pg_class ci ON ci.oid = i.indexrelid
+                        WHERE ci.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')
+                    ) AS idx_data
+                    CROSS JOIN LATERAL generate_series(1, idx_data.indnatts::int) AS gs(attpos)
+                ) AS ic
+                JOIN pg_class ct ON ct.oid = ic.tbloid
+                LEFT JOIN pg_attribute a1
+                    ON ic.indkey[ic.attpos] <> 0
+                    AND a1.attrelid = ic.tbloid
+                    AND a1.attnum = ic.indkey[ic.attpos]
+                LEFT JOIN pg_attribute a2
+                    ON ic.indkey[ic.attpos] = 0
+                    AND a2.attrelid = ic.idxoid
+                    AND a2.attnum = ic.attpos
+            ) AS i
+            JOIN pg_namespace n ON n.oid = i.relnamespace
+            JOIN pg_stats s
+                ON s.schemaname = n.nspname
+                AND s.tablename = i.attrelname
+                AND s.attname = i.attname
+            WHERE n.nspname <> 'information_schema'
+            GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+        ) AS col_stats
+    ) AS aligned
+) AS sml
+WHERE {relations};
 """
 
-# The estimated table bloat
+# The estimated index bloat
 INDEX_BLOAT = {
     'descriptors': [('schemaname', 'schema'), ('relname', 'table'), ('iname', 'index')],
     'metrics': {

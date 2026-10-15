@@ -2,7 +2,9 @@
 # All rights reserved
 # Licensed under Simplified BSD License (see LICENSE)
 
+import math
 import threading
+from decimal import ROUND_HALF_UP, Decimal
 
 import psycopg
 import pytest
@@ -220,6 +222,46 @@ def test_partition_relation(aggregator, integration_check, pg_instance):
         aggregator.assert_metric("postgresql.total_size", value=172032, count=1, tags=part_2_tags)
 
 
+def _btree_bloat_ratio(columns, reltuples, relpages, block_size, fillfactor, maxalign):
+    """Fillfactor-adjusted actual/estimated page ratio for the given index columns."""
+    relpages = int(relpages)
+    reltuples = float(reltuples)
+    block_size = float(block_size)
+    fillfactor = float(fillfactor)
+    maxalign = int(maxalign)
+    if relpages <= 0:
+        return 0.0
+
+    null_fracs = [float(null_frac) for _, null_frac in columns]
+    nulldatawidth = sum((1.0 - null_frac) * float(width) for width, null_frac in columns)
+    if max(null_fracs) == 0:
+        index_tuple_hdr_bm = 8
+    else:
+        index_tuple_hdr_bm = 8 + ((32 + 8 - 1) // 8)
+
+    header_mod = index_tuple_hdr_bm % maxalign
+    header_pad = maxalign if header_mod == 0 else header_mod
+    aligned_header = index_tuple_hdr_bm + maxalign - header_pad
+    if nulldatawidth == 0:
+        aligned_data = 0.0
+    else:
+        data_mod = int(nulldatawidth) % maxalign
+        data_pad = maxalign if data_mod == 0 else data_mod
+        aligned_data = nulldatawidth + maxalign - data_pad
+
+    nulldatahdrwidth = aligned_header + aligned_data
+    slots = math.floor((block_size - 16 - 24) * fillfactor / (100.0 * (4.0 + nulldatahdrwidth)))
+    if slots <= 0:
+        est_pages = 0
+    else:
+        est_pages = 1 + math.ceil(reltuples / slots)
+    if est_pages <= 0:
+        return 0.0
+
+    ratio = relpages / float(est_pages)
+    return float(Decimal(ratio).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
+
 @pytest.mark.integration
 @pytest.mark.usefixtures("dd_environment")
 @pytest.mark.parametrize(
@@ -233,16 +275,106 @@ def test_bloat_metrics(aggregator, collect_bloat_metrics, expected_count, integr
     pg_instance["relations"] = ["pg_index"]
     pg_instance["collect_bloat_metrics"] = collect_bloat_metrics
 
-    check = integration_check(pg_instance)
-    check.check(pg_instance)
+    conn = None
+    cursor = None
+    indexed_bloat = None
+    try:
+        if collect_bloat_metrics:
+            # Wide unindexed payload: bloat must follow the narrow indexed column, not the full row.
+            conn = _get_superconn(pg_instance)
+            cursor = conn.cursor()
+            cursor.execute("DROP TABLE IF EXISTS index_bloat_subset")
+            cursor.execute("CREATE TABLE index_bloat_subset (id integer NOT NULL, payload text NOT NULL)")
+            cursor.execute(
+                "INSERT INTO index_bloat_subset (id, payload) "
+                "SELECT i, repeat('x', 800) FROM generate_series(1, 2000) AS s(i)"
+            )
+            cursor.execute("CREATE INDEX index_bloat_subset_id_idx ON index_bloat_subset (id)")
+            cursor.execute("GRANT SELECT ON index_bloat_subset TO datadog")
+            cursor.execute("ANALYZE index_bloat_subset")
+            cursor.execute(
+                """
+                SELECT
+                    c.relpages,
+                    c.reltuples,
+                    coalesce(substring(array_to_string(c.reloptions, ' ') from 'fillfactor=([0-9]+)')::int, 90),
+                    current_setting('block_size')::int,
+                    CASE
+                        WHEN version() ~ 'mingw32|64-bit|x86_64|ppc64|ia64|amd64|aarch64|arm64' THEN 8
+                        ELSE 4
+                    END,
+                    id_stats.null_frac,
+                    id_stats.avg_width,
+                    payload_stats.null_frac,
+                    payload_stats.avg_width
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
+                JOIN pg_stats id_stats
+                    ON id_stats.schemaname = 'public'
+                    AND id_stats.tablename = 'index_bloat_subset'
+                    AND id_stats.attname = 'id'
+                JOIN pg_stats payload_stats
+                    ON payload_stats.schemaname = 'public'
+                    AND payload_stats.tablename = 'index_bloat_subset'
+                    AND payload_stats.attname = 'payload'
+                WHERE c.relname = 'index_bloat_subset_id_idx'
+                """
+            )
+            stats = cursor.fetchone()
+            assert stats is not None
+            (
+                relpages,
+                reltuples,
+                fillfactor,
+                block_size,
+                maxalign,
+                id_null_frac,
+                id_avg_width,
+                payload_null_frac,
+                payload_avg_width,
+            ) = stats
+            indexed_columns = [(id_avg_width, id_null_frac)]
+            indexed_bloat = _btree_bloat_ratio(indexed_columns, reltuples, relpages, block_size, fillfactor, maxalign)
+            full_row_bloat = _btree_bloat_ratio(
+                indexed_columns + [(payload_avg_width, payload_null_frac)],
+                reltuples,
+                relpages,
+                block_size,
+                fillfactor,
+                maxalign,
+            )
+            assert indexed_bloat != full_row_bloat
+            pg_instance["relations"].append("index_bloat_subset")
 
-    base_tags = _get_expected_tags(check, pg_instance, db=pg_instance["dbname"], table="pg_index", schema="pg_catalog")
-    aggregator.assert_metric("postgresql.table_bloat", count=expected_count, tags=base_tags)
+        check = integration_check(pg_instance)
+        check.check(pg_instance)
 
-    indices = ["pg_index_indrelid_index", "pg_index_indexrelid_index"]
-    for index in indices:
-        expected_tags = base_tags + ["index:{}".format(index)]
-        aggregator.assert_metric("postgresql.index_bloat", count=expected_count, tags=expected_tags)
+        base_tags = _get_expected_tags(
+            check, pg_instance, db=pg_instance["dbname"], table="pg_index", schema="pg_catalog"
+        )
+        aggregator.assert_metric("postgresql.table_bloat", count=expected_count, tags=base_tags)
+
+        indices = ["pg_index_indrelid_index", "pg_index_indexrelid_index"]
+        for index in indices:
+            expected_tags = base_tags + ["index:{}".format(index)]
+            aggregator.assert_metric("postgresql.index_bloat", count=expected_count, tags=expected_tags)
+
+        if collect_bloat_metrics:
+            subset_tags = _get_expected_tags(
+                check,
+                pg_instance,
+                db=pg_instance["dbname"],
+                table="index_bloat_subset",
+                schema="public",
+            )
+            subset_tags = subset_tags + ["index:index_bloat_subset_id_idx"]
+            aggregator.assert_metric("postgresql.index_bloat", count=1, value=indexed_bloat, tags=subset_tags)
+    finally:
+        if cursor is not None:
+            cursor.execute("DROP TABLE IF EXISTS index_bloat_subset")
+            cursor.close()
+        if conn is not None:
+            conn.close()
 
 
 @pytest.mark.integration
